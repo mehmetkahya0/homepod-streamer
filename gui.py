@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import logging.handlers
 import math
 import queue
 import shutil
@@ -15,8 +16,9 @@ from pathlib import Path
 
 import customtkinter as ctk
 
+import autostart
 from capture import display_name
-from config import load_config, update_config
+from config import LOG_PATH, load_config, update_config
 from controller import ACTIVE_STATES, Controller, Event, State
 from discovery import AirPlayDevice
 from firewall import FirewallState
@@ -120,6 +122,8 @@ class App(ctk.CTk):
         self._ui_calls: queue.Queue = queue.Queue()  # actions posted from other threads (tray)
         self._notified_reconnect = False
         self._closing = False
+        self._auto_stream_pending = bool(self.cfg["auto_stream"])
+        self._auto_stream_scans = 0
         self._show_event = _create_show_event()
 
         self.title(APP_NAME)
@@ -318,7 +322,7 @@ class App(ctk.CTk):
         block.pack(fill="x", pady=(0, 16))
         ctk.CTkLabel(block, text=title, font=self.fonts["body_bold"], text_color=C["text"], anchor="w").pack(fill="x")
         ctk.CTkLabel(block, text=desc, font=self.fonts["small"], text_color=C["muted"], anchor="w",
-                     justify="left", wraplength=360).pack(fill="x", pady=(2, 8))
+                     justify="left", wraplength=330).pack(fill="x", pady=(2, 8))
         return block
 
     def _segmented(self, master, values: list[str], command) -> ctk.CTkSegmentedButton:
@@ -330,8 +334,11 @@ class App(ctk.CTk):
 
     def _build_settings_tab(self, tab: ctk.CTkFrame) -> None:
         tab.configure(fg_color="transparent")
+        tab = ctk.CTkScrollableFrame(tab, fg_color="transparent", scrollbar_button_color=C["track"],
+                                     scrollbar_button_hover_color=C["field_hover"])
+        tab.pack(fill="both", expand=True)
         card = Card(tab, "Audio", GLYPH["settings"], self.fonts)
-        card.pack(fill="x", pady=(4, 10))
+        card.pack(fill="x", pady=(4, 10), padx=(0, 4))
 
         desc = "If Windows runs at 48 kHz, audio is converted to 44.1 kHz for AirPlay."
         if not self._has_ffmpeg:
@@ -356,7 +363,7 @@ class App(ctk.CTk):
             block, 200, 1000, 16, self.cfg["max_buffer_ms"], "max_buffer_ms")
 
         card = Card(tab, "General", GLYPH["settings"], self.fonts)
-        card.pack(fill="x")
+        card.pack(fill="x", padx=(0, 4))
         self._theme_labels = {"system": "System", "light": "Light", "dark": "Dark"}
         seg = self._segmented(card.body, list(self._theme_labels.values()), self._on_theme)
         seg.pack(fill="x")
@@ -367,6 +374,20 @@ class App(ctk.CTk):
         self.tray_switch.pack(fill="x", pady=(12, 0))
         if self.cfg["close_to_tray"]:
             self.tray_switch.select()
+        self.autostart_switch = ctk.CTkSwitch(card.body, text="Start with Windows (in the tray)",
+                                              font=self.fonts["small"], progress_color=C["accent"],
+                                              text_color=C["text"], command=self._on_autostart_switch)
+        self.autostart_switch.pack(fill="x", pady=(10, 0))
+        if autostart.is_enabled():
+            self.autostart_switch.select()
+        self.autostream_switch = ctk.CTkSwitch(card.body, text="Start streaming when the app opens",
+                                               font=self.fonts["small"], progress_color=C["accent"],
+                                               text_color=C["text"], command=self._on_autostream_switch)
+        self.autostream_switch.pack(fill="x", pady=(10, 0))
+        if self.cfg["auto_stream"]:
+            self.autostream_switch.select()
+        ctk.CTkLabel(card.body, text=f"Settings and log: {LOG_PATH.parent}", font=self.fonts["small"],
+                     text_color=C["muted"], anchor="w", justify="left", wraplength=330).pack(fill="x", pady=(12, 0))
 
         self.settings_note = ctk.CTkLabel(tab, text="", font=self.fonts["small"], text_color=C["warn"])
         self.settings_note.pack(fill="x", pady=(10, 0))
@@ -383,8 +404,9 @@ class App(ctk.CTk):
             self.cfg[key] = int(v)
             self._settings_changed()
 
+        # scroll_step=0: the mouse wheel scrolls the Settings page instead of silently changing the value
         slider = ctk.CTkSlider(row, from_=lo, to=hi, number_of_steps=steps, height=18, command=changed,
-                               progress_color=C["accent"], button_color=C["accent"],
+                               scroll_step=0, progress_color=C["accent"], button_color=C["accent"],
                                button_hover_color=C["accent_hover"], fg_color=C["track"])
         slider.pack(side="left", fill="x", expand=True)
         label.pack(side="left", padx=(8, 0))
@@ -522,6 +544,45 @@ class App(ctk.CTk):
         self.vol_value.configure(text=f"{round(value)}")
         glyph = "mute" if value < 1 else "vol1" if value < 34 else "vol2" if value < 67 else "vol3"
         self.vol_icon.configure(text=GLYPH[glyph])
+
+    def _on_autostart_switch(self) -> None:
+        on = bool(self.autostart_switch.get())
+        try:
+            autostart.set_enabled(on)
+        except OSError as ex:
+            _LOGGER.error("Could not change Start with Windows: %s", ex)
+            self.settings_note.configure(text=f"Could not change Start with Windows: {ex}")
+            # revert the switch (select/deselect don't re-run the command)
+            self.autostart_switch.deselect() if on else self.autostart_switch.select()
+
+    def _on_autostream_switch(self) -> None:
+        on = bool(self.autostream_switch.get())
+        update_config(auto_stream=on)
+        self.cfg["auto_stream"] = on
+
+    def _maybe_auto_stream(self) -> None:
+        """Start streaming once at launch if enabled, but only to the last used speaker.
+
+        Right after Windows sign-in the network may not be ready yet, so a missing
+        speaker triggers a few rescans instead of giving up (or picking another one).
+        """
+        if not self._auto_stream_pending or self.controller.state != State.IDLE:
+            return
+        dev = self._selected_device()
+        last = self.cfg.get("last_device")
+        if dev and (last is None or dev.identifier == last):
+            self._auto_stream_pending = False
+            _LOGGER.info("Auto-start streaming to %s", dev.name)
+            self.after(300, self._on_main_button)
+        elif self._auto_stream_scans < 6:
+            self._auto_stream_scans += 1
+            _LOGGER.info("Auto-start: last speaker not found yet, rescanning in 10 s (%d/6)",
+                         self._auto_stream_scans)
+            self.after(10_000, self.refresh_devices)
+        else:
+            self._auto_stream_pending = False
+            _LOGGER.warning("Auto-start: last speaker not found, giving up")
+            self.tray.notify("Could not find your speaker on the network; streaming was not started.")
 
     def _on_tray_switch(self) -> None:
         on = bool(self.tray_switch.get())
@@ -683,6 +744,7 @@ class App(ctk.CTk):
             self.device_info.configure(text=message or "Make sure you're on the same network, then refresh.")
             self._update_main_button()
             self._sync_tray()
+            self._maybe_auto_stream()
             return
         names = list(self.devices)
         self.device_menu.configure(values=names, state="normal")
@@ -690,6 +752,7 @@ class App(ctk.CTk):
         chosen = next((n for n, d in self.devices.items() if d.identifier == last), names[0])
         self.device_menu.set(chosen)
         self._on_device_selected(chosen)
+        self._maybe_auto_stream()
 
     def _on_loopbacks(self, devs: list[dict], message: str) -> None:
         self.loopbacks = {display_name(d): d for d in devs}
@@ -788,14 +851,6 @@ def run_gui(debug: bool = False, minimized: bool = False) -> int:
 
     With ``minimized`` the app starts hidden in the tray (used for autostart).
     """
-    cfg = load_config()
-    log_queue: queue.Queue[str] = queue.Queue()
-    root = logging.getLogger()
-    root.addHandler(QueueLogHandler(log_queue))
-    if sys.stderr:  # there is no stderr under pythonw
-        logging.basicConfig(format="%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%H:%M:%S")
-    _configure_log_levels(debug or cfg["debug"])
-
     if sys.platform == "win32":
         # Single instance: if the app is already running, bring its window back
         if acquire_named_mutex(GUI_MUTEX) is None:
@@ -803,6 +858,21 @@ def run_gui(debug: bool = False, minimized: bool = False) -> int:
             return 0
         # Show our own icon in the taskbar instead of python.exe's
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("HomePodStreamer")
+
+    cfg = load_config()
+    log_queue: queue.Queue[str] = queue.Queue()
+    root = logging.getLogger()
+    root.addHandler(QueueLogHandler(log_queue))
+    # The exe has no console; a small rotating log file makes autostart problems diagnosable
+    file_handler = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=1,
+                                                        encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+    root.addHandler(file_handler)
+    if sys.stderr:  # there is no stderr under pythonw / the windowed exe
+        logging.basicConfig(format="%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%H:%M:%S")
+    _configure_log_levels(debug or cfg["debug"])
+    _LOGGER.info("Starting %s (minimized=%s)", APP_NAME, minimized)
+    autostart.repair()
     ctk.set_appearance_mode(cfg["theme"])
     ctk.set_default_color_theme("blue")
 

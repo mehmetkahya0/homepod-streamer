@@ -13,6 +13,34 @@ pip install -r requirements.txt
 
 In the Home app, set **Home Settings > Speakers & TV > Allow Speaker & TV Access = "Everyone on the Same Network"**, with no password.
 
+## Standalone exe
+
+```powershell
+pip install -r requirements-dev.txt
+python build.py            # -> dist\HomePod Streamer.exe (single file, ~33 MB)
+```
+
+Copy `HomePod Streamer.exe` anywhere and run it; Python is not needed on the target machine.
+
+- **First run**: the app shows a firewall warning because the exe is a new program for Windows
+  Firewall. Click **Allow** (administrator approval) once. Rules are per program path, so moving
+  the exe to another folder needs this again.
+- **Settings and log** live in `%APPDATA%\HomePod Streamer\` (`config.json`,
+  `homepod-streamer.log`). When running from source they stay in the project folder.
+- **ffmpeg** is not bundled. If it's in `PATH`, the "High quality (soxr)" resampler is available;
+  otherwise the built-in one is used.
+- The exe is not code-signed, so Windows SmartScreen may warn on first launch
+  ("More info" > "Run anyway").
+
+### Start with Windows
+
+**Settings > General > Start with Windows** adds a per-user entry to
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (no admin rights) that starts the app
+hidden in the tray. Together with **Start streaming when the app opens**, the PC streams to the
+last used speaker right after sign-in. If that speaker isn't reachable yet (the network may
+still be coming up), the app rescans up to 6 times, 10 s apart; it never switches to a
+different speaker on its own. If the exe is moved, the entry is updated on its next launch.
+
 ## Interface (GUI)
 
 Double-click the **`HomePod Streamer.lnk`** shortcut in the project folder (no console window opens).
@@ -100,7 +128,9 @@ connection fails (e.g. firewall), the error is shown instead of retrying forever
 | `gui.py` | CustomTkinter interface |
 | `tray.py` | System tray icon and menu (pystray) |
 | `firewall.py` | Windows Firewall check and rule creation (UAC) |
-| `config.py` | `config.json` |
+| `config.py` | `config.json`, data folder (project folder or `%APPDATA%` for the exe) |
+| `autostart.py` | Start with Windows (HKCU Run key) |
+| `build.py` | PyInstaller build of the single-file exe |
 | `main.py` | Entry point: GUI with no arguments, CLI with subcommands |
 | `make_icon.py` | Generates `assets/icon.ico` (one-off) |
 
