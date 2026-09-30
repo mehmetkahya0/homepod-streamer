@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import signal
 import sys
 
 from capture import list_loopback_devices
@@ -83,6 +84,7 @@ async def cmd_live(args: argparse.Namespace) -> int:
         max_buffer_ms=args.max_buffer_ms,
         resampler=args.resampler,
         stats_interval=args.stats_interval,
+        auto_reconnect=not args.no_reconnect,
     )
     try:
         await stream_live(dev, settings, args.volume, args.duration)
@@ -121,6 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
                       help="44.1 kHz resampler: miniaudio (built in) or ffmpeg (soxr, higher quality)")
     live.add_argument("--stats-interval", type=float, default=10.0, help="stats log interval in s")
     live.add_argument("--duration", type=float, help="stop automatically after N seconds (for testing)")
+    live.add_argument("--no-reconnect", action="store_true", help="don't reconnect after a connection loss")
     return p
 
 
@@ -139,10 +142,16 @@ def main() -> int:
     if not args.debug:
         logging.getLogger("pyatv").setLevel(logging.WARNING)
 
+    if hasattr(signal, "SIGBREAK"):
+        # Ctrl+Break / closing the console window: stop cleanly like Ctrl+C
+        # (TEARDOWN to the HomePod, release the capture device and ffmpeg)
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
+
     handler = {"scan": cmd_scan, "play": cmd_play, "loopbacks": cmd_loopbacks, "live": cmd_live}[args.command]
     try:
         return asyncio.run(handler(args))
     except KeyboardInterrupt:
+        _LOGGER.info("Interrupted, exiting")
         return 130
 
 

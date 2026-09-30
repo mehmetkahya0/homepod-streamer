@@ -17,7 +17,7 @@ import customtkinter as ctk
 
 from capture import display_name
 from config import load_config, update_config
-from controller import Controller, Event, State
+from controller import ACTIVE_STATES, Controller, Event, State
 from discovery import AirPlayDevice
 from firewall import FirewallState
 from streamer import RAOP_RATE, LiveSettings, acquire_named_mutex
@@ -57,6 +57,7 @@ STATE_STYLE = {
     State.IDLE: ("Ready", "muted"),
     State.CONNECTING: ("Connecting", "warn"),
     State.STREAMING: ("Streaming", "ok"),
+    State.RECONNECTING: ("Reconnecting", "warn"),
     State.STOPPING: ("Stopping", "warn"),
     State.ERROR: ("Error", "danger"),
 }
@@ -469,7 +470,7 @@ class App(ctk.CTk):
 
     def _on_main_button(self) -> None:
         state = self.controller.state
-        if state == State.STREAMING or state == State.CONNECTING:
+        if state in (State.STREAMING, State.CONNECTING, State.RECONNECTING):
             self.controller.stop()
             return
         dev = self._selected_device()
@@ -507,8 +508,9 @@ class App(ctk.CTk):
         if state == State.STREAMING:
             self.main_button.configure(text="■   Stop", state="normal", fg_color=C["danger"],
                                        hover_color=C["danger_hover"])
-        elif state == State.CONNECTING:
-            self.main_button.configure(text="Connecting…   (cancel)", state="normal", fg_color=C["warn"],
+        elif state in (State.CONNECTING, State.RECONNECTING):
+            label = "Connecting…" if state == State.CONNECTING else "Reconnecting…"
+            self.main_button.configure(text=f"{label}   (cancel)", state="normal", fg_color=C["warn"],
                                        hover_color=C["warn"])
         elif state == State.STOPPING:
             self.main_button.configure(text="Stopping…", state="disabled")
@@ -521,11 +523,12 @@ class App(ctk.CTk):
         label, color = STATE_STYLE[state]
         self.pill_text.configure(text=label)
         self.pill_dot.configure(text_color=C[color])
-        busy = state in (State.CONNECTING, State.STREAMING, State.STOPPING)
+        busy = state in ACTIVE_STATES
         for w in (self.device_menu, self.source_menu, self.device_refresh, self.source_refresh):
             w.configure(state="disabled" if busy else "normal")
         self._base_message = message
-        self.message.configure(text=message, text_color=C["danger"] if state == State.ERROR else C["muted"])
+        color = C["danger"] if state == State.ERROR else C["warn"] if state == State.RECONNECTING else C["muted"]
+        self.message.configure(text=message, text_color=color)
         if state in (State.IDLE, State.ERROR):
             self.settings_note.configure(text="")
             self._update_source_info()
@@ -538,8 +541,11 @@ class App(ctk.CTk):
             self._on_devices(ev.data, ev.message)
         elif ev.kind == "loopbacks":
             self._on_loopbacks(ev.data, ev.message)
-        elif ev.kind == "started":
+        elif ev.kind in ("started", "source"):
             self._update_source_info(ev.data)
+        elif ev.kind == "default_output":
+            if self.controller.state not in ACTIVE_STATES:
+                self.refresh_loopbacks()  # keep "System default" info current while idle
         elif ev.kind == "stats":
             self._on_stats(ev.data)
         elif ev.kind == "firewall":

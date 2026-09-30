@@ -1,4 +1,5 @@
 pyatv==0.18.0
 PyAudioWPatch==0.2.12.8
 customtkinter==6.0.0
+pycaw==20260927
 pillow

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import shutil
 import socket
 import struct
 import sys
@@ -19,14 +20,18 @@ from pyatv import exceptions
 from pyatv.const import Protocol
 from pyatv.interface import AppleTV, AudioListener, MediaMetadata
 
-from capture import AudioFormat, FfmpegResampler, LoopbackCapture
-from discovery import AirPlayDevice, pairing_blocked
+from capture import AudioFormat, FfmpegResampler, LoopbackCapture, display_name, output_monitor
+from discovery import AirPlayDevice, find_device, pairing_blocked
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class SessionLostError(ConnectionError):
-    """The HomePod closed the AirPlay session (e.g. another source connected)."""
+    """The HomePod closed the AirPlay session (e.g. another source connected); not retried."""
+
+
+class ConnectionLostError(ConnectionError):
+    """The connection to the HomePod broke (network drop, HomePod restart); retried."""
 
 
 class AlreadyStreamingError(RuntimeError):
@@ -150,6 +155,7 @@ class LiveSettings:
     max_buffer_ms: int = 300  # if the queue exceeds this it is trimmed to prebuffer level (latency cap)
     resampler: str = "miniaudio"  # "miniaudio" (inside pyatv) or "ffmpeg" (soxr)
     stats_interval: float = 10.0
+    auto_reconnect: bool = True  # reconnect after a network drop / HomePod restart
 
 
 def wav_header(fmt: AudioFormat) -> bytes:
@@ -260,13 +266,26 @@ class LiveWavStream(io.BufferedIOBase):
 
 
 class LivePipeline:
-    """Manage the loopback capture -> (ffmpeg) -> LiveWavStream chain."""
+    """Manage the loopback capture -> (ffmpeg) -> LiveWavStream chain.
 
-    def __init__(self, settings: LiveSettings) -> None:
+    When following the system default (``settings.loopback is None``) the
+    capture switches to the new default output mid-stream. If an explicitly
+    selected device disappears, it falls back to the system default. The WAV
+    stream handed to pyatv keeps its sample rate; if the new device's rate
+    differs, an ffmpeg resampler is inserted. Only if that is impossible is
+    ``restart_needed`` set so the session can restart the pipeline.
+    """
+
+    def __init__(self, settings: LiveSettings, on_source_changed: Callable[[str], None] | None = None) -> None:
         self.settings = settings
+        self.on_source_changed = on_source_changed
         self.stream: LiveWavStream | None = None
+        self.restart_needed = threading.Event()
         self._capture = LoopbackCapture(self._on_capture, settings.chunk_ms, settings.loopback)
         self._resampler: FfmpegResampler | None = None
+        self._switch_lock = threading.RLock()  # _switch is also called under it
+        self._following_default = settings.loopback is None
+        self._stopped = False
 
     def _on_capture(self, data: bytes) -> None:
         if self._resampler:
@@ -278,29 +297,101 @@ class LivePipeline:
         if self.stream:
             self.stream.push(data)
 
+    def _make_resampler(self, in_fmt: AudioFormat, out_rate: int) -> AudioFormat:
+        self._resampler = FfmpegResampler(in_fmt, out_rate, self._on_resampled, self.settings.chunk_ms)
+        return self._resampler.start()
+
     def start(self) -> LiveWavStream:
         """Start capturing and return the stream to hand to pyatv."""
         cap_fmt = self._capture.start()
         out_fmt = cap_fmt
         try:
             if self.settings.resampler == "ffmpeg" and cap_fmt.rate != RAOP_RATE:
-                self._resampler = FfmpegResampler(cap_fmt, RAOP_RATE, self._on_resampled, self.settings.chunk_ms)
-                out_fmt = self._resampler.start()
+                out_fmt = self._make_resampler(cap_fmt, RAOP_RATE)
             elif cap_fmt.rate != RAOP_RATE:
                 _LOGGER.info("Resampling: miniaudio %d -> %d Hz", cap_fmt.rate, RAOP_RATE)
         except Exception:
             self._capture.stop()
             raise
         self.stream = LiveWavStream(out_fmt, self.settings)
+        output_monitor().subscribe(self._on_output_poll)
         return self.stream
 
+    def _on_output_poll(self, default_name: str | None, changed: bool) -> None:
+        """Called by the output monitor on every poll (monitor thread)."""
+        # Check and switch atomically: while a switch is in progress the old capture is
+        # already stopped, and an unlocked "capture inactive" check would switch back.
+        with self._switch_lock:
+            self._handle_output_poll(default_name, changed)
+
+    def _handle_output_poll(self, default_name: str | None, changed: bool) -> None:
+        if self._stopped:
+            return
+        if self._following_default and changed and default_name:
+            self._switch(default_name, f"default output changed to {default_name}")
+        elif not self._capture.active:
+            if self._following_default:
+                target = default_name
+                reason = "capture stopped, reopening the default output"
+            else:
+                self._following_default = True
+                target = default_name
+                reason = f"{self.settings.loopback} is no longer available, falling back to the system default"
+            if target:
+                self._switch(target, reason)
+
+    def _switch(self, device_name: str, reason: str) -> None:
+        """Swap the capture device without interrupting the AirPlay session."""
+        with self._switch_lock:
+            if self._stopped or self.stream is None:
+                return
+            current = self._capture.device
+            if current and display_name(current) == device_name and self._capture.active:
+                return
+            _LOGGER.info("Switching audio source: %s", reason)
+            old_rate = int(current["defaultSampleRate"]) if current else None
+            self._capture.stop()
+            new_capture = LoopbackCapture(self._on_capture, self.settings.chunk_ms, device_name)
+            try:
+                new_fmt = new_capture.start()
+            except Exception as ex:
+                _LOGGER.warning("Could not open %s (%s); will retry", device_name, ex)
+                self._capture = new_capture  # inactive; the next poll retries
+                return
+            self._capture = new_capture
+            target_rate = self.stream.fmt.rate
+            try:
+                if self._resampler and new_fmt.rate != old_rate:
+                    # Keep the output rate, restart ffmpeg with the new input rate
+                    self._resampler.stop()
+                    self._resampler = None
+                    if new_fmt.rate != target_rate:
+                        self._make_resampler(new_fmt, target_rate)
+                elif not self._resampler and new_fmt.rate != target_rate:
+                    if shutil.which("ffmpeg"):
+                        self._make_resampler(new_fmt, target_rate)
+                    else:
+                        _LOGGER.info("Sample rate changed (%d -> %d Hz); restarting the pipeline",
+                                     target_rate, new_fmt.rate)
+                        self.restart_needed.set()
+                        return
+            except Exception:
+                _LOGGER.exception("Resampler switch failed; restarting the pipeline")
+                self.restart_needed.set()
+                return
+        if self.on_source_changed:
+            self.on_source_changed(self.description)
+
     def stop(self) -> None:
-        if self.stream:
-            self.stream.stop()
-        self._capture.stop()
-        if self._resampler:
-            self._resampler.stop()
-            self._resampler = None
+        self._stopped = True
+        output_monitor().unsubscribe(self._on_output_poll)
+        with self._switch_lock:
+            if self.stream:
+                self.stream.stop()
+            self._capture.stop()
+            if self._resampler:
+                self._resampler.stop()
+                self._resampler = None
 
     @property
     def description(self) -> str:
@@ -332,10 +423,24 @@ class _VolumeListener(AudioListener):
         pass
 
 
-class LiveSession:
-    """A live streaming session to one device: connect, stream, volume, stats.
 
-    ``run()`` lasts until cancelled (Ctrl+C / Stop) or until ``duration`` elapses.
+
+# Errors that end a session for good (retrying cannot help)
+_FATAL_ERRORS = (SessionLostError, AlreadyStreamingError, exceptions.AuthenticationError, LookupError, FileNotFoundError)
+# Errors that mean "the connection broke" and are worth a reconnect
+_RECOVERABLE_ERRORS = (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError,
+                       exceptions.ConnectionFailedError, exceptions.ProtocolError)
+
+PROBE_INTERVAL = 2.0  # s between reachability probes while streaming
+PROBE_FAILURES = 2  # consecutive failed probes before the connection counts as lost
+MAX_BACKOFF = 30.0  # s
+
+
+class LiveSession:
+    """A live streaming session to one device: connect, stream, volume, stats, reconnect.
+
+    ``run()`` lasts until cancelled (Ctrl+C / Stop), until ``duration`` elapses,
+    or until a non-recoverable error (e.g. another device took over the HomePod).
     """
 
     def __init__(
@@ -346,16 +451,23 @@ class LiveSession:
         on_stats: Callable[[dict], None] | None = None,
         on_volume: Callable[[float], None] | None = None,
         on_started: Callable[[str], None] | None = None,
+        on_reconnecting: Callable[[int, float, BaseException], None] | None = None,
+        on_source_changed: Callable[[str], None] | None = None,
     ) -> None:
         self.device = device
         self.settings = settings
-        self.initial_volume = volume
+        self.volume_level = volume
         self.on_stats = on_stats
         self.on_volume = on_volume
         self.on_started = on_started
+        self.on_reconnecting = on_reconnecting
+        self.on_source_changed = on_source_changed
         self.atv: AppleTV | None = None
         self.pipeline: LivePipeline | None = None
+        self._ever_streamed = False
+        self._flowed_this_session = False
 
+    # ------------------------------------------------------------------ status
     @property
     def level(self) -> float:
         """Peak level of the last captured packet (0..1), for the level meter."""
@@ -369,10 +481,17 @@ class LiveSession:
         return self.atv.audio.volume if self.atv else None
 
     async def set_volume(self, level: float) -> None:
-        """Change the volume (0-100) while streaming."""
+        """Change the volume (0-100) while streaming; also re-applied after a reconnect."""
+        self.volume_level = max(0.0, min(100.0, level))
         if self.atv:
-            await self.atv.audio.set_volume(max(0.0, min(100.0, level)))
+            await self.atv.audio.set_volume(self.volume_level)
 
+    def _on_device_volume(self, level: float) -> None:
+        self.volume_level = level
+        if self.on_volume:
+            self.on_volume(level)
+
+    # ----------------------------------------------------------------- helpers
     async def _report_stats(self, stream: LiveWavStream) -> None:
         fmt = stream.fmt
 
@@ -396,6 +515,32 @@ class LiveSession:
             if self.on_stats:
                 self.on_stats(stats)
 
+    def _raop_port(self) -> int:
+        service = self.device.config.get_service(Protocol.RAOP)
+        return service.port if service and service.port else 7000
+
+    async def _reachable(self, timeout: float = 2.0) -> bool:
+        """Can a TCP connection be opened to the HomePod's AirPlay port?"""
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.device.address, self._raop_port()), timeout)
+        except (OSError, asyncio.TimeoutError):
+            return False
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+        return True
+
+    async def _loss_error(self, what: str) -> Exception:
+        """Classify a lost session: HomePod still reachable = taken over, otherwise network loss."""
+        if await self._reachable():
+            return SessionLostError(
+                "The HomePod closed the session. Another device may have connected to it."
+            )
+        return ConnectionLostError(f"Lost connection to the HomePod ({what}).")
+
     def _rtsp_transport_open(self) -> bool | None:
         """Is the RTSP control connection open? None if unknown.
 
@@ -414,7 +559,7 @@ class LiveSession:
         return conn.transport is not None
 
     async def _watchdog(self) -> None:
-        """Raise SessionLostError when the control connection closes."""
+        """Raise when the RTSP control connection closes."""
         seen_open = False
         warned = False
         while True:
@@ -428,9 +573,29 @@ class LiveSession:
             if state:
                 seen_open = True
             elif seen_open:
-                raise SessionLostError(
-                    "The HomePod closed the session. Another device may have connected to it, or it restarted."
-                )
+                raise await self._loss_error("control connection closed")
+
+    async def _health(self) -> None:
+        """Raise ConnectionLostError when the HomePod stops answering.
+
+        On a network drop the TCP connection is not closed and pyatv ignores
+        feedback errors, so without this probe the stream would keep sending
+        into the void.
+        """
+        failures = 0
+        while True:
+            await asyncio.sleep(PROBE_INTERVAL)
+            if await self._reachable():
+                failures = 0
+                continue
+            failures += 1
+            _LOGGER.debug("HomePod reachability probe failed (%d/%d)", failures, PROBE_FAILURES)
+            if failures >= PROBE_FAILURES:
+                raise ConnectionLostError("Lost connection to the HomePod (it stopped responding).")
+
+    async def _wait_restart(self, pipeline: LivePipeline) -> None:
+        while not pipeline.restart_needed.is_set():
+            await asyncio.sleep(0.5)
 
     async def _announce_when_flowing(self, source: LiveWavStream) -> None:
         """Call on_started once audio is actually flowing (SETUP/RECORD complete).
@@ -441,53 +606,98 @@ class LiveSession:
         threshold = source.fmt.bytes_for_ms(1500)
         while source.total_out < threshold:
             await asyncio.sleep(0.2)
+        self._ever_streamed = self._flowed_this_session = True
         _LOGGER.info("Live stream started -> %s", self.device.name)
         if self.on_started:
             self.on_started(self.pipeline.description if self.pipeline else "")
 
+    # --------------------------------------------------------------------- run
     async def run(self, duration: float | None = None) -> None:
-        """Connect and stream system audio."""
+        """Connect and stream system audio, reconnecting after connection loss."""
         with StreamLock():
-            await self._run(duration)
-
-    async def _run(self, duration: float | None) -> None:
-        self.atv = await connect(self.device)
-        if self.on_volume:
-            self.atv.audio.listener = _VolumeListener(self.on_volume)
-        metadata = MediaMetadata(title="System audio", artist=socket.gethostname())
-        deadline = time.monotonic() + duration if duration else None
-        try:
-            if self.initial_volume is not None:
-                await self.atv.audio.set_volume(self.initial_volume)
+            deadline = time.monotonic() + duration if duration else None
+            attempt = 0
             while True:
-                self.pipeline = LivePipeline(self.settings)
+                try:
+                    await self._session(deadline)
+                    return
+                except _FATAL_ERRORS:
+                    raise
+                except _RECOVERABLE_ERRORS as ex:
+                    # The first connection must succeed on its own (e.g. a firewall
+                    # problem should be reported, not retried forever).
+                    if not (self.settings.auto_reconnect and self._ever_streamed):
+                        raise
+                    attempt = 1 if self._flowed_this_session else attempt + 1
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return
+                    delay = min(2.0 ** (attempt - 1), MAX_BACKOFF)
+                    _LOGGER.warning("%s Reconnecting in %.0f s (attempt %d)", ex, delay, attempt)
+                    if self.on_reconnecting:
+                        self.on_reconnecting(attempt, delay, ex)
+                    await asyncio.sleep(delay)
+                    if attempt >= 2:
+                        await self._refresh_device()
+
+    async def _refresh_device(self) -> None:
+        """Rescan in case the HomePod came back with a different IP address."""
+        try:
+            dev = await find_device(self.device.identifier, timeout=3)
+        except Exception as ex:
+            _LOGGER.debug("Rescan failed: %s", ex)
+            return
+        if dev and dev.address != self.device.address:
+            _LOGGER.info("HomePod address changed: %s -> %s", self.device.address, dev.address)
+        if dev:
+            self.device = dev
+
+    async def _session(self, deadline: float | None) -> None:
+        """One connection: connect, stream (restarting the pipeline as needed), disconnect."""
+        self._flowed_this_session = False
+        self.atv = await connect(self.device)
+        self.atv.audio.listener = _VolumeListener(self._on_device_volume)
+        metadata = MediaMetadata(title="System audio", artist=socket.gethostname())
+        try:
+            if self.volume_level is not None:
+                await self.atv.audio.set_volume(self.volume_level)
+            while True:
+                self.pipeline = LivePipeline(self.settings, self.on_source_changed)
                 source = self.pipeline.start()
-                stats = asyncio.create_task(self._report_stats(source))
                 play = asyncio.create_task(self.atv.stream.stream_file(source, metadata=metadata))
-                watchdog = asyncio.create_task(self._watchdog())
-                announce = asyncio.create_task(self._announce_when_flowing(source))
+                monitors = {
+                    asyncio.create_task(self._watchdog()),
+                    asyncio.create_task(self._health()),
+                    asyncio.create_task(self._wait_restart(self.pipeline)),
+                }
+                helpers = {
+                    asyncio.create_task(self._report_stats(source)),
+                    asyncio.create_task(self._announce_when_flowing(source)),
+                }
                 _LOGGER.info("Setting up HomePod session -> %s", self.device.name)
                 try:
                     timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
-                    done, _ = await asyncio.wait({play, watchdog}, timeout=timeout,
+                    done, _ = await asyncio.wait({play, *monitors}, timeout=timeout,
                                                  return_when=asyncio.FIRST_COMPLETED)
                     if not done:
                         _LOGGER.info("Duration elapsed, stopping")
                         return
-                    if watchdog in done:
-                        watchdog.result()  # SessionLostError
+                    for task in done - {play}:
+                        task.result()  # watchdog/health raise; restart waiter returns
+                    if play not in done:
+                        _LOGGER.info("Restarting the audio pipeline")
+                        continue
                     play.result()  # raise on error
                     # A normal end is only expected when the WAV length limit is reached
                     if source.total_out < _WAV_DATA_SIZE * 0.95:
-                        raise SessionLostError("The stream ended unexpectedly (the HomePod dropped the connection).")
+                        raise await self._loss_error("the stream ended unexpectedly")
                     _LOGGER.info("Stream reached the WAV length limit, restarting")
                 finally:
-                    for task in (stats, watchdog, announce):
+                    for task in (*monitors, *helpers):
                         task.cancel()
                     self.pipeline.stop()  # releases pending read() calls
                     if not play.done():
                         play.cancel()
-                    await asyncio.gather(play, stats, watchdog, announce, return_exceptions=True)
+                    await asyncio.gather(play, *monitors, *helpers, return_exceptions=True)
         finally:
             self.atv.close()
             self.atv = None

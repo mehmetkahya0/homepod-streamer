@@ -18,9 +18,9 @@ from typing import Any, Coroutine
 from pyatv import exceptions
 
 import firewall
-from capture import list_loopback_devices
+from capture import list_loopback_devices, output_monitor
 from discovery import AirPlayDevice, scan_devices
-from streamer import AlreadyStreamingError, LiveSession, LiveSettings, SessionLostError
+from streamer import AlreadyStreamingError, ConnectionLostError, LiveSession, LiveSettings, SessionLostError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,13 +29,20 @@ class State(enum.Enum):
     IDLE = "idle"
     CONNECTING = "connecting"
     STREAMING = "streaming"
+    RECONNECTING = "reconnecting"
     STOPPING = "stopping"
     ERROR = "error"
 
 
+ACTIVE_STATES = (State.CONNECTING, State.STREAMING, State.RECONNECTING, State.STOPPING)
+
+
 @dataclass
 class Event:
-    """Event sent to the UI: kind ∈ state | devices | loopbacks | stats | volume | started | firewall."""
+    """Event sent to the UI.
+
+    kind ∈ state | devices | loopbacks | stats | volume | started | source | firewall | default_output
+    """
 
     kind: str
     data: Any = None
@@ -44,7 +51,7 @@ class Event:
 
 def friendly_error(ex: BaseException) -> str:
     """Turn an exception into a message suitable for the user."""
-    if isinstance(ex, (SessionLostError, AlreadyStreamingError)):
+    if isinstance(ex, (SessionLostError, ConnectionLostError, AlreadyStreamingError)):
         return str(ex)
     if isinstance(ex, exceptions.AuthenticationError):
         return ("The HomePod refused the connection. In the Home app, set 'Allow Speaker & TV Access' "
@@ -62,6 +69,8 @@ def friendly_error(ex: BaseException) -> str:
         return "ffmpeg not found. Select the 'Standard' resampler in Settings."
     if isinstance(ex, OSError) and getattr(ex, "errno", None) in (-9996, -9997, -9998, -9999):
         return f"Could not open the audio device ({ex}). It may be in use or disconnected."
+    if isinstance(ex, OSError):  # socket errors: unreachable host/network, reset, ...
+        return "Could not reach the HomePod. Is it on and on the same network as this computer?"
     return f"{type(ex).__name__}: {ex}"
 
 
@@ -76,6 +85,12 @@ class Controller:
         self._thread.start()
         self._session: LiveSession | None = None
         self._task: asyncio.Task | None = None
+        output_monitor().subscribe(self._on_output_poll)
+
+    def _on_output_poll(self, name: str | None, changed: bool) -> None:
+        """Default output changed (monitor thread): lets the UI refresh the source info."""
+        if changed:
+            self._emit("default_output", name)
 
     # --- helpers -----------------------------------------------------------------
     def _submit(self, coro: Coroutine) -> concurrent.futures.Future:
@@ -132,7 +147,7 @@ class Controller:
     # --- streaming ---------------------------------------------------------------
     def start(self, device: AirPlayDevice, settings: LiveSettings, volume: float) -> None:
         """Start streaming (does nothing if already running)."""
-        if self.state in (State.CONNECTING, State.STREAMING, State.STOPPING):
+        if self.state in ACTIVE_STATES:
             return
         self._set_state(State.CONNECTING, f"Connecting to {device.name}…")
         self._submit(self._run(device, settings, volume))
@@ -142,11 +157,17 @@ class Controller:
             self._set_state(State.STREAMING, f"Playing on {device.name}")
             self._emit("started", desc)
 
+        def on_reconnecting(attempt: int, delay: float, reason: BaseException) -> None:
+            self._set_state(State.RECONNECTING,
+                            f"{friendly_error(reason)}\nReconnecting in {delay:.0f} s (attempt {attempt})…")
+
         self._session = LiveSession(
             device, settings, volume,
             on_stats=lambda s: self._emit("stats", s),
             on_volume=lambda v: self._emit("volume", v),
             on_started=on_started,
+            on_reconnecting=on_reconnecting,
+            on_source_changed=lambda desc: self._emit("source", desc),
         )
         self._task = asyncio.current_task()
         try:
@@ -177,9 +198,9 @@ class Controller:
         return self._submit(job())
 
     def set_volume(self, level: float) -> None:
-        """Change the volume while streaming (ignored if not streaming)."""
+        """Change the volume during a session (stored and re-applied after a reconnect)."""
         session = self._session
-        if session and self.state == State.STREAMING:
+        if session:
             fut = self._submit(session.set_volume(level))
             fut.add_done_callback(
                 lambda f: f.exception() and _LOGGER.warning("Could not set volume: %s", f.exception())

@@ -58,13 +58,30 @@ Stats line: `sent` should match real time (~10 s every 10 s). `underruns` should
 audio is playing. `peak` is the peak level of the captured audio; 0% means nothing is being
 captured (wrong output device?).
 
+### Reliability
+
+| Situation | Detection | Behavior |
+|---|---|---|
+| Network drop, HomePod restarted or powered off | TCP probe to the HomePod's AirPlay port every 2 s; 2 failures in a row | Reconnects automatically (backoff 1, 2, 4 … 30 s; rescans from the 2nd attempt in case the IP changed). Volume is re-applied. |
+| Another device (iPhone, Mac…) takes over the HomePod | Control connection closed while the HomePod is still reachable | Stops with a message, **no** reconnect (so the two senders don't fight) |
+| Default output changes (e.g. headphones plugged in) | Windows Core Audio poll every 1.5 s | Capture switches to the new device **without interrupting the AirPlay session**. If its sample rate differs, an ffmpeg resampler is inserted. |
+| Selected device disappears | Capture stream stops | Falls back to the system default |
+| Ctrl+C / Ctrl+Break / closing the window | | Clean shutdown: HomePod session torn down, capture and ffmpeg released |
+
+Source switching only applies when the audio source is **System default**. If you pick a
+specific device, the app stays on it even when the Windows default changes.
+
+Automatic reconnect only starts after audio has flowed at least once; if the very first
+connection fails (e.g. firewall), the error is shown instead of retrying forever.
+`python main.py live --no-reconnect` disables it on the command line.
+
 ### Modules
 
 | File | Purpose |
 |---|---|
 | `discovery.py` | AirPlay device discovery |
-| `capture.py` | WASAPI loopback capture, ffmpeg/soxr resampling |
-| `streamer.py` | Jitter buffer, endless WAV stream, `LiveSession` (pyatv), connection watchdog, single-stream lock |
+| `capture.py` | WASAPI loopback capture, ffmpeg/soxr resampling, default output monitor (pycaw) |
+| `streamer.py` | Jitter buffer, endless WAV stream, source switching, `LiveSession` (pyatv) with reconnect, connection watchdog and reachability probe, single-stream lock |
 | `controller.py` | Runs the asyncio engine on a background thread, event queue to the UI |
 | `gui.py` | CustomTkinter interface |
 | `firewall.py` | Windows Firewall check and rule creation (UAC) |
@@ -89,6 +106,7 @@ internal pyatv field. If it is missing in another version, the watchdog disables
 |---|---|
 | "The firewall has no rule for this app" / "The HomePod could not complete setup" | During AirPlay 2 setup the HomePod connects back to this computer. Windows Firewall stores permissions per program path, so the terminal (`python.exe`) may be allowed while the GUI (`pythonw.exe`) is blocked. The app's **Allow** button adds a local-network-only rule ("HomePod Streamer") with administrator approval. |
 | "The HomePod closed the session" | Another device (iPhone, Mac…) connected to the HomePod. Streaming stops on purpose; press Start again to take it back. |
+| "Reconnecting…" that never succeeds | The HomePod is off or on another network. Press **Reconnecting… (cancel)** to stop. |
 | "Another HomePod Streamer stream is already running" | Only one stream can run at a time (GUI or terminal). Close the other one. |
 | The level meter doesn't move | Audio is playing through a different output. Select the right device under "Audio source". |
 

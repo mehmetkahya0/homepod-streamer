@@ -56,13 +56,93 @@ def display_name(dev: dict) -> str:
 
 
 def _find_loopback(pa: pyaudio.PyAudio, name: str | None) -> dict:
-    """Find a loopback device by name fragment, or the default output's loopback."""
+    """Find a loopback device by exact name, then by name fragment, or the default output's loopback."""
     if name:
-        for dev in pa.get_loopback_device_info_generator():
-            if name.lower() in dev["name"].lower():
+        devices = list(pa.get_loopback_device_info_generator())
+        wanted = name.removesuffix(" [Loopback]").lower()
+        for dev in devices:
+            if display_name(dev).lower() == wanted:
+                return dev
+        for dev in devices:
+            if wanted in dev["name"].lower():
                 return dev
         raise LookupError(f"no loopback device matching '{name}'")
     return pa.get_default_wasapi_loopback()
+
+
+OutputListener = Callable[[str | None, bool], None]
+
+
+class DefaultOutputMonitor:
+    """Polls the Windows default output device on a dedicated COM thread.
+
+    PortAudio caches the device list at initialization, so it cannot see a
+    default-device change (e.g. headphones plugged in); the Core Audio API
+    (MMDevice, via pycaw) can. Listeners are called on every poll with
+    ``(name, changed)`` on the monitor thread.
+    """
+
+    def __init__(self, interval: float = 1.5) -> None:
+        self.interval = interval
+        self.name: str | None = None
+        self._listeners: list[OutputListener] = []
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="output-monitor", daemon=True)
+        self._thread.start()
+        self._ready.wait(3)
+
+    def subscribe(self, listener: OutputListener) -> None:
+        with self._lock:
+            self._listeners.append(listener)
+
+    def unsubscribe(self, listener: OutputListener) -> None:
+        with self._lock:
+            if listener in self._listeners:
+                self._listeners.remove(listener)
+
+    def _query(self) -> str | None:
+        from pycaw.pycaw import AudioUtilities
+
+        try:
+            return str(AudioUtilities.GetSpeakers().FriendlyName)
+        except Exception as ex:  # no output device, COM error, ...
+            _LOGGER.debug("Could not read the default output device: %s", ex)
+            return None
+
+    def _run(self) -> None:
+        import comtypes
+
+        comtypes.CoInitialize()  # daemon thread; COM stays initialized until process exit
+        self.name = self._query()
+        self._ready.set()
+        stop = threading.Event()
+        while not stop.wait(self.interval):
+            name = self._query()
+            changed = name != self.name
+            if changed:
+                _LOGGER.info("Default output changed: %s -> %s", self.name, name)
+                self.name = name
+            with self._lock:
+                listeners = list(self._listeners)
+            for listener in listeners:
+                try:
+                    listener(name, changed)
+                except Exception:
+                    _LOGGER.exception("Output device listener failed")
+
+
+_monitor: DefaultOutputMonitor | None = None
+_monitor_lock = threading.Lock()
+
+
+def output_monitor() -> DefaultOutputMonitor:
+    """Shared, lazily started default-output monitor."""
+    global _monitor
+    with _monitor_lock:
+        if _monitor is None:
+            _monitor = DefaultOutputMonitor()
+        return _monitor
 
 
 class LoopbackCapture:
