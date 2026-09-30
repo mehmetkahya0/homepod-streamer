@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+
+# Per-user settings (last device, volume, theme)
+config.json
+
+# Windows shortcut (contains absolute paths to this machine's venv)
+*.lnk
+
+# PyInstaller (stage 6)
+build/
+dist/
+*.spec
+
+# Logs
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

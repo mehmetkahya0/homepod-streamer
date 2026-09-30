@@ -1,0 +1,103 @@
+# HomePod Streamer
+
+Streams Windows system audio to a HomePod mini over AirPlay (RAOP).
+
+## Setup
+
+```powershell
+cd homepod-streamer
+py -3.12 -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+In the Home app, set **Home Settings > Speakers & TV > Allow Speaker & TV Access = "Everyone on the Same Network"**, with no password.
+
+## Interface (GUI)
+
+Double-click the **`HomePod Streamer.lnk`** shortcut in the project folder (no console window opens).
+You can copy it to the desktop or the Start menu. Alternative: `python main.py`.
+
+- **Stream**: speaker and audio source selection, Start/Stop, live volume, input level meter
+  and connection status
+- **Settings**: resampler (Standard / High quality soxr), jitter buffer, latency cap, theme
+- **Log**: live log with a "Verbose logging" switch
+
+All choices are saved to `config.json` and remembered on the next launch.
+
+## Command line
+
+```powershell
+python main.py scan                          # list AirPlay devices on the network
+python main.py play samples\tone.wav         # play a file (prompts for a device, saves it to config.json)
+python main.py play music.mp3 --device "Living Room" --volume 30
+python main.py --debug play samples\tone.wav # verbose pyatv logs
+python main.py --host 192.168.1.50 scan      # query an IP directly if mDNS doesn't work
+
+python main.py loopbacks                     # output devices that can be captured
+python main.py live                          # stream system audio live (Ctrl+C to stop)
+python main.py live --volume 30 --loopback "Headphones"
+python main.py live --resampler ffmpeg       # 48k -> 44.1k conversion via ffmpeg/soxr (ffmpeg must be in PATH)
+```
+
+Device names come from Windows, so they appear in your Windows display language
+(e.g. "Speakers" or "Hoparlör"). `--loopback` matches any part of the name.
+
+### Live streaming options
+
+| Option | Default | Description |
+|---|---|---|
+| `--loopback` | system default | Part of the name of the output device to capture |
+| `--chunk-ms` | 20 | WASAPI capture period |
+| `--prebuffer-ms` | 100 | Jitter buffer. Increase if the stats show frequent underruns |
+| `--max-buffer-ms` | 300 | If the queue exceeds this it is trimmed to prebuffer level (latency cap) |
+| `--resampler` | ffmpeg if found, else miniaudio | `miniaudio` (inside pyatv) or `ffmpeg` (soxr, higher quality) |
+| `--stats-interval` | 10 | Stats log interval (s) |
+
+Stats line: `sent` should match real time (~10 s every 10 s). `underruns` should be 0 while
+audio is playing. `peak` is the peak level of the captured audio; 0% means nothing is being
+captured (wrong output device?).
+
+### Modules
+
+| File | Purpose |
+|---|---|
+| `discovery.py` | AirPlay device discovery |
+| `capture.py` | WASAPI loopback capture, ffmpeg/soxr resampling |
+| `streamer.py` | Jitter buffer, endless WAV stream, `LiveSession` (pyatv), connection watchdog, single-stream lock |
+| `controller.py` | Runs the asyncio engine on a background thread, event queue to the UI |
+| `gui.py` | CustomTkinter interface |
+| `firewall.py` | Windows Firewall check and rule creation (UAC) |
+| `config.py` | `config.json` |
+| `main.py` | Entry point: GUI with no arguments, CLI with subcommands |
+| `make_icon.py` | Generates `assets/icon.ico` (one-off) |
+
+### How it works
+
+WASAPI loopback (PyAudioWPatch) → (optional ffmpeg/soxr) → jitter buffer → endless WAV
+stream → `pyatv` `stream_file()` (RAOP, 44.1 kHz/16-bit/stereo). Loopback produces no data
+while Windows isn't playing anything, so silence is inserted; otherwise pyatv would treat the
+stream as finished. Because of the length limit in the WAV header, the stream restarts with a
+short gap roughly every 6 hours.
+
+`pyatv` is pinned to 0.18.0: the watchdog that detects a closed HomePod session reads an
+internal pyatv field. If it is missing in another version, the watchdog disables itself.
+
+## Troubleshooting
+
+| Message | Meaning / fix |
+|---|---|
+| "The firewall has no rule for this app" / "The HomePod could not complete setup" | During AirPlay 2 setup the HomePod connects back to this computer. Windows Firewall stores permissions per program path, so the terminal (`python.exe`) may be allowed while the GUI (`pythonw.exe`) is blocked. The app's **Allow** button adds a local-network-only rule ("HomePod Streamer") with administrator approval. |
+| "The HomePod closed the session" | Another device (iPhone, Mac…) connected to the HomePod. Streaming stops on purpose; press Start again to take it back. |
+| "Another HomePod Streamer stream is already running" | Only one stream can run at a time (GUI or terminal). Close the other one. |
+| The level meter doesn't move | Audio is playing through a different output. Select the right device under "Audio source". |
+
+## Known limitations
+
+- **AirPlay has about 2 seconds of latency.** Fine for music and podcasts; **not suitable**
+  for video or game audio sync.
+- Audio plays from both the PC speakers and the HomePod (loopback copies the playing device).
+  Whether the Windows master volume/mute affects the captured signal depends on the driver;
+  check the `peak` value in the stats line.
+- If Windows Firewall blocks Python's local network access (mDNS UDP 5353), no devices are
+  found; allow "Private networks" in the prompt that appears on first run.
