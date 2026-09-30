@@ -100,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--debug", action="store_true", help="verbose logging")
     p.add_argument("--timeout", type=int, default=5, help="scan duration (s)")
     p.add_argument("--host", help="query this IP directly instead of mDNS")
+    p.add_argument("--minimized", action="store_true", help="GUI: start hidden in the system tray")
     sub = p.add_subparsers(dest="command")
     sub.add_parser("gui", help="open the graphical interface (default)")
 
@@ -132,7 +133,7 @@ def main() -> int:
     if args.command in (None, "gui"):
         from gui import run_gui
 
-        return run_gui(debug=args.debug)
+        return run_gui(debug=args.debug, minimized=args.minimized)
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,

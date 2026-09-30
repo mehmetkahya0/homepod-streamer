@@ -25,6 +25,20 @@ You can copy it to the desktop or the Start menu. Alternative: `python main.py`.
 
 All choices are saved to `config.json` and remembered on the next launch.
 
+### System tray
+
+The app keeps running in the system tray when you close the window (turn this off under
+**Settings > General**). The tray icon shows the status with a colored dot (green: streaming,
+orange: connecting/reconnecting, red: error) and its tooltip names the speaker.
+
+- **Left-click**: show the window
+- **Right-click**: Start/Stop, Speaker, Audio source, Volume (±5 or 10–100%), Show window, **Exit**
+
+While the window is hidden, Windows notifications report a lost connection, a successful
+reconnect and errors. **Exit** in the tray menu is what fully quits the app. Launching the app
+again while it is running brings the existing window back instead of opening a second one.
+`python main.py --minimized` starts directly in the tray.
+
 ## Command line
 
 ```powershell
@@ -84,6 +98,7 @@ connection fails (e.g. firewall), the error is shown instead of retrying forever
 | `streamer.py` | Jitter buffer, endless WAV stream, source switching, `LiveSession` (pyatv) with reconnect, connection watchdog and reachability probe, single-stream lock |
 | `controller.py` | Runs the asyncio engine on a background thread, event queue to the UI |
 | `gui.py` | CustomTkinter interface |
+| `tray.py` | System tray icon and menu (pystray) |
 | `firewall.py` | Windows Firewall check and rule creation (UAC) |
 | `config.py` | `config.json` |
 | `main.py` | Entry point: GUI with no arguments, CLI with subcommands |

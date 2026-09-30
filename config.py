@@ -20,6 +20,8 @@ DEFAULTS: dict[str, Any] = {
     "max_buffer_ms": 300,
     "theme": "system",  # system | light | dark
     "debug": False,
+    "close_to_tray": True,  # closing the window keeps the app running in the tray
+    "tray_hint_shown": False,  # the "still running in the tray" notification was shown once
 }
 
 

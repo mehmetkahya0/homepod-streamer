@@ -21,12 +21,15 @@ from controller import ACTIVE_STATES, Controller, Event, State
 from discovery import AirPlayDevice
 from firewall import FirewallState
 from streamer import RAOP_RATE, LiveSettings, acquire_named_mutex
+from tray import TrayActions, TrayIcon
 
 _LOGGER = logging.getLogger(__name__)
 
 APP_NAME = "HomePod Streamer"
 ICON_PATH = Path(__file__).with_name("assets") / "icon.ico"
 DEFAULT_SOURCE = "System default"
+GUI_MUTEX = "Local\\HomePodStreamer.GUI"
+SHOW_EVENT = "Local\\HomePodStreamer.Show"  # set by a second launch to bring this window back
 
 # (light, dark) color pairs, inspired by Apple system colors
 C = {
@@ -114,6 +117,10 @@ class App(ctk.CTk):
         self._vol_pending: float | None = None
         self._vol_touched = 0.0
         self._has_ffmpeg = shutil.which("ffmpeg") is not None
+        self._ui_calls: queue.Queue = queue.Queue()  # actions posted from other threads (tray)
+        self._notified_reconnect = False
+        self._closing = False
+        self._show_event = _create_show_event()
 
         self.title(APP_NAME)
         self._base_height = 660
@@ -151,6 +158,16 @@ class App(ctk.CTk):
         self._build_settings_tab(self.tabs.add("Settings"))
         self._build_log_tab(self.tabs.add("Log"))
         self.tabs._segmented_button.configure(font=self.fonts["body"])
+
+        self.tray = TrayIcon(APP_NAME, TrayActions(
+            toggle_stream=self._on_main_button,
+            select_device=self._select_device,
+            select_source=self._select_source,
+            set_volume=self._set_volume_from_tray,
+            show_window=self.show_window,
+            exit_app=self.quit_app,
+        ), self.post)
+        self.tray.start()
 
         self._apply_state(State.IDLE, "")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -334,16 +351,22 @@ class App(ctk.CTk):
             block, 40, 400, 18, self.cfg["prebuffer_ms"], "prebuffer_ms")
 
         block = self._setting_block(card.body, "Latency cap",
-                                    "If the buffer grows beyond this, the excess is dropped to keep latency low.")
+                                    "Excess audio above this is dropped to keep latency low.")
         self.maxbuf_slider, self.maxbuf_value = self._value_slider(
             block, 200, 1000, 16, self.cfg["max_buffer_ms"], "max_buffer_ms")
 
-        card = Card(tab, "Appearance", GLYPH["settings"], self.fonts)
+        card = Card(tab, "General", GLYPH["settings"], self.fonts)
         card.pack(fill="x")
         self._theme_labels = {"system": "System", "light": "Light", "dark": "Dark"}
         seg = self._segmented(card.body, list(self._theme_labels.values()), self._on_theme)
         seg.pack(fill="x")
         seg.set(self._theme_labels.get(self.cfg["theme"], "System"))
+        self.tray_switch = ctk.CTkSwitch(card.body, text="Keep running in the tray when the window is closed",
+                                         font=self.fonts["small"], progress_color=C["accent"],
+                                         text_color=C["text"], command=self._on_tray_switch)
+        self.tray_switch.pack(fill="x", pady=(12, 0))
+        if self.cfg["close_to_tray"]:
+            self.tray_switch.select()
 
         self.settings_note = ctk.CTkLabel(tab, text="", font=self.fonts["small"], text_color=C["warn"])
         self.settings_note.pack(fill="x", pady=(10, 0))
@@ -406,10 +429,12 @@ class App(ctk.CTk):
             update_config(last_device=dev.identifier)
             self.device_info.configure(text=f"{dev.model} · {dev.address}")
         self._update_main_button()
+        self._sync_tray()
 
     def _on_source_selected(self, name: str) -> None:
         update_config(loopback=None if name == DEFAULT_SOURCE else self.loopbacks[name]["name"])
         self._update_source_info()
+        self._sync_tray()
 
     def _current_loopback(self) -> dict | None:
         name = self.source_menu.get()
@@ -491,16 +516,104 @@ class App(ctk.CTk):
             return
         self.controller.set_volume(value)
         update_config(volume=round(value))
+        self._sync_tray()
 
     def _update_volume_label(self, value: float) -> None:
         self.vol_value.configure(text=f"{round(value)}")
         glyph = "mute" if value < 1 else "vol1" if value < 34 else "vol2" if value < 67 else "vol3"
         self.vol_icon.configure(text=GLYPH[glyph])
 
+    def _on_tray_switch(self) -> None:
+        on = bool(self.tray_switch.get())
+        update_config(close_to_tray=on)
+        self.cfg["close_to_tray"] = on
+
     def _on_close(self) -> None:
+        """Window close button: hide to the tray or exit, depending on the setting."""
+        if self.cfg["close_to_tray"]:
+            self.hide_to_tray()
+        else:
+            self.quit_app()
+
+    def hide_to_tray(self) -> None:
         self.withdraw()
+        if not load_config()["tray_hint_shown"]:
+            update_config(tray_hint_shown=True)
+            self.tray.notify("Still running in the system tray. Right-click the icon to stop or exit.")
+
+    def show_window(self) -> None:
+        self.deiconify()
+        self.state("normal")
+        self.lift()
+        self.attributes("-topmost", True)  # Windows won't always raise a window on request
+        self.after(300, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+
+    def quit_app(self) -> None:
+        """Stop streaming, remove the tray icon and close."""
+        if self._closing:
+            return
+        self._closing = True
+        self.withdraw()
+        self.tray.stop()
         self.controller.shutdown()
         self.destroy()
+
+    def post(self, fn) -> None:
+        """Run ``fn`` on the UI thread (safe to call from any thread)."""
+        self._ui_calls.put(fn)
+
+    # ------------------------------------------------------------------ tray
+    def _is_hidden(self) -> bool:
+        return self.state() == "withdrawn"
+
+    def _sync_tray(self) -> None:
+        """Copy the current UI state into the tray snapshot and rebuild its menu."""
+        snap = self.tray.snapshot
+        state = self.controller.state
+        dev = self._selected_device()
+        label = STATE_STYLE[state][0]
+        snap.state = state.value
+        snap.status = f"{label} · {dev.name}" if dev and state in ACTIVE_STATES else label
+        snap.active = state in ACTIVE_STATES
+        snap.can_start = dev is not None
+        snap.devices = list(self.devices)
+        snap.device = self.device_menu.get() if dev else None
+        snap.sources = [DEFAULT_SOURCE, *self.loopbacks]
+        snap.source = self.source_menu.get()
+        snap.volume = round(self.vol_slider.get())
+        self.tray.refresh()
+
+    def _select_device(self, name: str) -> None:
+        if name in self.devices and self.controller.state not in ACTIVE_STATES:
+            self.device_menu.set(name)
+            self._on_device_selected(name)
+
+    def _select_source(self, name: str) -> None:
+        if (name == DEFAULT_SOURCE or name in self.loopbacks) and self.controller.state not in ACTIVE_STATES:
+            self.source_menu.set(name)
+            self._on_source_selected(name)
+
+    def _set_volume_from_tray(self, value: int) -> None:
+        self.vol_slider.set(value)
+        self._on_volume(float(value))
+
+    def _notify_if_hidden(self, state: State, message: str) -> None:
+        """Tray notifications for events the user can't see while the window is hidden."""
+        if state == State.RECONNECTING:
+            if not self._notified_reconnect and self._is_hidden():
+                self.tray.notify(message.splitlines()[0] + " Reconnecting…")
+            self._notified_reconnect = True
+            return
+        if state == State.STREAMING and self._notified_reconnect:
+            self._notified_reconnect = False
+            if self._is_hidden():
+                self.tray.notify(f"Reconnected. {message}".strip())
+            return
+        if state in (State.IDLE, State.ERROR):
+            self._notified_reconnect = False
+        if state == State.ERROR and self._is_hidden():
+            self.tray.notify(message, "Streaming stopped")
 
     # ---------------------------------------------------------- state/events
     def _update_main_button(self) -> None:
@@ -533,6 +646,8 @@ class App(ctk.CTk):
             self.settings_note.configure(text="")
             self._update_source_info()
         self._update_main_button()
+        self._notify_if_hidden(state, message)
+        self._sync_tray()
 
     def _handle_event(self, ev: Event) -> None:
         if ev.kind == "state":
@@ -554,6 +669,7 @@ class App(ctk.CTk):
             if time.monotonic() - self._vol_touched > 1.5:  # sync only if the user isn't dragging
                 self.vol_slider.set(ev.data)
                 self._update_volume_label(ev.data)
+                self._sync_tray()
 
     def _on_devices(self, devices: list[AirPlayDevice], message: str) -> None:
         self.devices = {}
@@ -566,6 +682,7 @@ class App(ctk.CTk):
             self.device_menu.set("No speakers found")
             self.device_info.configure(text=message or "Make sure you're on the same network, then refresh.")
             self._update_main_button()
+            self._sync_tray()
             return
         names = list(self.devices)
         self.device_menu.configure(values=names, state="normal")
@@ -585,6 +702,7 @@ class App(ctk.CTk):
         self._update_source_info()
         if message:
             self.source_info.configure(text=message)
+        self._sync_tray()
 
     def _on_stats(self, s: dict) -> None:
         if self.controller.state != State.STREAMING:
@@ -598,12 +716,21 @@ class App(ctk.CTk):
         self.message.configure(text=f"{self._base_message}\n{text}", text_color=color)
 
     def _tick(self) -> None:
-        """Every 50 ms: process events, logs and the level meter."""
+        """Every 50 ms: process events, tray actions, logs and the level meter."""
         try:
             while True:
                 self._handle_event(self.controller.events.get_nowait())
         except queue.Empty:
             pass
+        try:
+            while not self._closing:
+                self._ui_calls.get_nowait()()
+        except queue.Empty:
+            pass
+        if self._closing:
+            return  # quit_app() destroyed the widgets; don't touch them or reschedule
+        if self._show_event and ctypes.windll.kernel32.WaitForSingleObject(ctypes.c_void_p(self._show_event), 0) == 0:
+            self.show_window()  # another launch asked us to come to the front
 
         lines = []
         try:
@@ -635,8 +762,32 @@ def _configure_log_levels(debug: bool) -> None:
     logging.getLogger("pyatv").setLevel(logging.DEBUG if debug else logging.WARNING)
 
 
-def run_gui(debug: bool = False) -> int:
-    """Start the interface; returns when the window closes."""
+def _create_show_event() -> int | None:
+    """Auto-reset event a second launch sets to bring this instance's window back."""
+    if sys.platform != "win32":
+        return None
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.CreateEventW.restype = ctypes.c_void_p
+    return kernel32.CreateEventW(None, False, False, SHOW_EVENT)
+
+
+def _signal_running_instance() -> None:
+    """Ask the already running instance to show its window (it may be hidden in the tray)."""
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.OpenEventW.restype = ctypes.c_void_p
+    kernel32.SetEvent.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel32.OpenEventW(0x0002, False, SHOW_EVENT)  # EVENT_MODIFY_STATE
+    if handle:
+        kernel32.SetEvent(handle)
+        kernel32.CloseHandle(handle)
+
+
+def run_gui(debug: bool = False, minimized: bool = False) -> int:
+    """Start the interface; returns when the app exits (tray Exit, or close with the tray disabled).
+
+    With ``minimized`` the app starts hidden in the tray (used for autostart).
+    """
     cfg = load_config()
     log_queue: queue.Queue[str] = queue.Queue()
     root = logging.getLogger()
@@ -646,13 +797,9 @@ def run_gui(debug: bool = False) -> int:
     _configure_log_levels(debug or cfg["debug"])
 
     if sys.platform == "win32":
-        # Single window: if the app is already open, bring it to the front
-        if acquire_named_mutex("Local\\HomePodStreamer.GUI") is None:
-            user32 = ctypes.windll.user32
-            hwnd = user32.FindWindowW(None, APP_NAME)
-            if hwnd:
-                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-                user32.SetForegroundWindow(hwnd)
+        # Single instance: if the app is already running, bring its window back
+        if acquire_named_mutex(GUI_MUTEX) is None:
+            _signal_running_instance()
             return 0
         # Show our own icon in the taskbar instead of python.exe's
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("HomePodStreamer")
@@ -661,6 +808,8 @@ def run_gui(debug: bool = False) -> int:
 
     controller = Controller()
     app = App(controller, log_queue)
+    if minimized:
+        app.withdraw()
     app.mainloop()
     return 0
 
